@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,8 +44,12 @@ func NewTraceID(now time.Time) string {
 	return fmt.Sprintf("trace_%s_%d", now.Format("20060102_150405"), now.UnixNano()%1_000_000)
 }
 
+func (r *Recorder) SummaryPath(record RequestRecord) string {
+	return filepath.Join(r.traceDir(record), "summary.md")
+}
+
 func (r *Recorder) Record(record RequestRecord) error {
-	dir := filepath.Join(r.cfg.Dir, record.StartedAt.Format("2006-01-02"), record.TraceID)
+	dir := r.traceDir(record)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -60,6 +65,10 @@ func (r *Recorder) Record(record RequestRecord) error {
 	}
 
 	return nil
+}
+
+func (r *Recorder) traceDir(record RequestRecord) string {
+	return filepath.Join(r.cfg.Dir, record.StartedAt.Format("2006-01-02"), record.TraceID)
 }
 
 func writeJSON(path string, value any, pretty bool) error {
@@ -150,9 +159,39 @@ func formatSummary(record RequestRecord) string {
 	builder.WriteString(fmt.Sprintf("- Model: `%s`\n", emptyAsUnknown(request.Model)))
 	builder.WriteString("\n")
 
+	if artifacts := artifactsOutput(); artifacts != "" {
+		builder.WriteString("## Artifacts\n\n")
+		builder.WriteString(artifacts)
+		builder.WriteString("\n\n")
+	}
+
 	if usage := usageOutput(record); usage != "" {
 		builder.WriteString("## Usage\n\n")
 		builder.WriteString(usage)
+		builder.WriteString("\n\n")
+	}
+
+	if requestParameters := requestParametersOutput(record.Body); requestParameters != "" {
+		builder.WriteString("## Request Parameters\n\n")
+		builder.WriteString(requestParameters)
+		builder.WriteString("\n\n")
+	}
+
+	if providerDiagnostics := providerDiagnosticsOutput(record.ResponseHeaders); providerDiagnostics != "" {
+		builder.WriteString("## Provider Diagnostics\n\n")
+		builder.WriteString(providerDiagnostics)
+		builder.WriteString("\n\n")
+	}
+
+	if responseMetadata := responseMetadataOutput(record); responseMetadata != "" {
+		builder.WriteString("## Response Metadata\n\n")
+		builder.WriteString(responseMetadata)
+		builder.WriteString("\n\n")
+	}
+
+	if finishReasons := finishReasonsOutput(record); finishReasons != "" {
+		builder.WriteString("## Finish Reasons\n\n")
+		builder.WriteString(finishReasons)
 		builder.WriteString("\n\n")
 	}
 
@@ -194,6 +233,51 @@ func formatSummary(record RequestRecord) string {
 	}
 
 	return builder.String()
+}
+
+func artifactsOutput() string {
+	return "- Request JSON: `request.json`\n- Response JSON: `response.json`"
+}
+
+func providerDiagnosticsOutput(headers map[string][]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+
+	targets := []string{
+		"x-request-id",
+		"request-id",
+		"openai-request-id",
+		"anthropic-request-id",
+		"cf-ray",
+		"openai-processing-ms",
+		"x-ratelimit-limit-requests",
+		"x-ratelimit-remaining-requests",
+		"x-ratelimit-reset-requests",
+		"x-ratelimit-limit-tokens",
+		"x-ratelimit-remaining-tokens",
+		"x-ratelimit-reset-tokens",
+	}
+
+	var lines []string
+	for _, target := range targets {
+		values, ok := lookupHeaderValues(headers, target)
+		if !ok {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s: `%s`", target, strings.Join(values, ", ")))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func lookupHeaderValues(headers map[string][]string, target string) ([]string, bool) {
+	for key, values := range headers {
+		if strings.EqualFold(key, target) {
+			return values, true
+		}
+	}
+	return nil, false
 }
 
 type openAIRequest struct {
@@ -298,6 +382,66 @@ func assistantOutput(record RequestRecord) string {
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
+func finishReasonsOutput(record RequestRecord) string {
+	var reasons []string
+	if record.Stream {
+		reasons = extractStreamFinishReasons(record.ResponseBody)
+	} else {
+		reasons = responseFinishReasons(record.ResponseBody)
+	}
+
+	if len(reasons) == 0 {
+		return ""
+	}
+
+	var lines []string
+	for index, reason := range reasons {
+		lines = append(lines, fmt.Sprintf("- Choice %d: `%s`", index+1, reason))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func responseFinishReasons(body []byte) []string {
+	var response struct {
+		Choices []struct {
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil
+	}
+
+	var reasons []string
+	for _, choice := range response.Choices {
+		if choice.FinishReason == nil || *choice.FinishReason == "" {
+			continue
+		}
+		reasons = append(reasons, *choice.FinishReason)
+	}
+	return reasons
+}
+
+func extractStreamFinishReasons(body []byte) []string {
+	var reasons []string
+	for _, event := range streamDataEvents(body) {
+		var payload struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(event), &payload); err != nil {
+			continue
+		}
+		for _, choice := range payload.Choices {
+			if choice.FinishReason == nil || *choice.FinishReason == "" {
+				continue
+			}
+			reasons = append(reasons, *choice.FinishReason)
+		}
+	}
+	return reasons
+}
+
 func toolCallOutput(record RequestRecord) string {
 	if record.Stream {
 		return formatAnyToolCallDeltas(extractStreamToolCalls(record.ResponseBody))
@@ -348,6 +492,106 @@ func reasoningOutput(record RequestRecord) string {
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
+func requestParametersOutput(body []byte) string {
+	parameters := topLevelJSONObject(body)
+	delete(parameters, "model")
+	delete(parameters, "messages")
+	return formatObjectFields(parameters)
+}
+
+func responseMetadataOutput(record RequestRecord) string {
+	metadata := responseMetadata(record)
+	delete(metadata, "choices")
+	delete(metadata, "usage")
+	return formatObjectFields(metadata)
+}
+
+func responseMetadata(record RequestRecord) map[string]any {
+	if record.Stream {
+		return streamResponseMetadata(record.ResponseBody)
+	}
+	return topLevelJSONObject(record.ResponseBody)
+}
+
+func streamResponseMetadata(body []byte) map[string]any {
+	metadata := map[string]any{}
+	for _, event := range streamDataEvents(body) {
+		payload := topLevelJSONObject([]byte(event))
+		for key, value := range payload {
+			if _, exists := metadata[key]; !exists {
+				metadata[key] = value
+			}
+		}
+	}
+	return metadata
+}
+
+func topLevelJSONObject(data []byte) map[string]any {
+	var object map[string]any
+	if err := json.Unmarshal(data, &object); err != nil {
+		return map[string]any{}
+	}
+	return object
+}
+
+func formatObjectFields(fields map[string]any) string {
+	if len(fields) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var builder strings.Builder
+	for _, key := range keys {
+		value := fields[key]
+		if formatted, ok := formatScalarFieldValue(value); ok {
+			builder.WriteString(fmt.Sprintf("- %s: `%s`\n", key, formatted))
+			continue
+		}
+
+		builder.WriteString(fmt.Sprintf("- %s:\n", key))
+		builder.WriteString(formatAnyAsJSONCodeBlock(value))
+		builder.WriteString("\n")
+	}
+
+	return strings.TrimSpace(builder.String())
+}
+
+func formatScalarFieldValue(value any) (string, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return "null", true
+	case string:
+		if strings.ContainsAny(typed, "`\n") {
+			return "", false
+		}
+		return typed, true
+	case bool:
+		return strconv.FormatBool(typed), true
+	case float64:
+		if math.Trunc(typed) == typed {
+			return fmt.Sprintf("%.0f", typed), true
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64), true
+	case json.Number:
+		return typed.String(), true
+	default:
+		return "", false
+	}
+}
+
+func formatAnyAsJSONCodeBlock(value any) string {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("```text\n%v\n```", value)
+	}
+	return "```json\n" + string(data) + "\n```"
+}
+
 func usageOutput(record RequestRecord) string {
 	usage := responseUsage(record)
 	if len(usage) == 0 {
@@ -373,8 +617,31 @@ func usageOutput(record RequestRecord) string {
 			lines = append(lines, fmt.Sprintf("- %s: `%s`", field.label, value))
 		}
 	}
+	if hitRate, ok := cacheHitRate(usage); ok {
+		lines = append(lines, fmt.Sprintf("- Cache Hit Rate: `%.1f%%`", hitRate))
+	}
 
 	return strings.Join(lines, "\n")
+}
+
+func cacheHitRate(usage map[string]any) (float64, bool) {
+	input, ok := usageNumber(usage, []string{"prompt_tokens"})
+	if !ok {
+		input, ok = usageNumber(usage, []string{"input_tokens"})
+	}
+	if !ok || input <= 0 {
+		return 0, false
+	}
+
+	cached, ok := usageNumber(usage, []string{"prompt_tokens_details", "cached_tokens"})
+	if !ok {
+		cached, ok = usageNumber(usage, []string{"input_tokens_details", "cached_tokens"})
+	}
+	if !ok {
+		return 0, false
+	}
+
+	return (cached / input) * 100, true
 }
 
 func responseUsage(record RequestRecord) map[string]any {

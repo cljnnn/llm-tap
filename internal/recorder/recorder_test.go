@@ -1,9 +1,12 @@
 package recorder
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"llm-tap/internal/config"
 )
 
 func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T) {
@@ -18,6 +21,10 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 		Stream:      false,
 		Body: []byte(`{
 			"model": "gpt-4.1-mini",
+			"temperature": 0.2,
+			"max_tokens": 1024,
+			"stream": false,
+			"metadata": {"feature": "debug"},
 			"messages": [
 				{
 					"role": "assistant",
@@ -41,6 +48,9 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 			]
 		}`),
 		ResponseBody: []byte(`{
+			"id": "chatcmpl_123",
+			"object": "chat.completion",
+			"created": 1780317296,
 			"usage": {
 				"prompt_tokens": 1234,
 				"completion_tokens": 30,
@@ -70,6 +80,15 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 		"`call_1`",
 		"#### Tool Results — `call_1`",
 		"```text\nsunny\n```",
+		"## Request Parameters",
+		"- max_tokens: `1024`",
+		"- metadata:\n```json\n{\n  \"feature\": \"debug\"\n}\n```",
+		"- stream: `false`",
+		"- temperature: `0.2`",
+		"## Response Metadata",
+		"- created: `1780317296`",
+		"- id: `chatcmpl_123`",
+		"- object: `chat.completion`",
 		"## Reasoning Output",
 		"I used the tool result to answer.",
 		"## Usage",
@@ -77,6 +96,7 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 		"- Output Tokens: `30`",
 		"- Total Tokens: `1,234,567 (1.23M)`",
 		"- Cached Input Tokens: `80`",
+		"- Cache Hit Rate: `6.5%`",
 		"- Reasoning Tokens: `12`",
 		"## Assistant Output",
 		"Final answer",
@@ -86,6 +106,106 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 		if !strings.Contains(summary, want) {
 			t.Fatalf("summary missing %q\n\nsummary:\n%s", want, summary)
 		}
+	}
+
+	assertSectionOrder(t, summary, "## Artifacts", "## Usage", "## Request Parameters")
+}
+
+func TestFormatSummaryIncludesArtifactsProviderDiagnosticsFinishReasonsAndCacheEfficiency(t *testing.T) {
+	record := RequestRecord{
+		TraceID:     "trace_20260601_123456_789",
+		StartedAt:   time.Date(2026, 6, 1, 12, 34, 56, 0, time.UTC),
+		Method:      "POST",
+		Path:        "/v1/chat/completions",
+		UpstreamURL: "https://upstream.example.com/v1",
+		StatusCode:  200,
+		Duration:    123 * time.Millisecond,
+		Stream:      false,
+		ResponseHeaders: map[string][]string{
+			"OpenAI-Request-ID":              {"req_123"},
+			"x-ratelimit-remaining-requests": {"9"},
+			"X-Request-ID":                   {"abc", "def"},
+		},
+		Body: []byte(`{
+			"model": "gpt-4.1-mini",
+			"messages": [{"role": "user", "content": "hello"}]
+		}`),
+		ResponseBody: []byte(`{
+			"usage": {
+				"prompt_tokens": 100,
+				"completion_tokens": 20,
+				"total_tokens": 120,
+				"prompt_tokens_details": {
+					"cached_tokens": 25
+				}
+			},
+			"choices": [
+				{
+					"finish_reason": "stop",
+					"message": {"content": "done"}
+				},
+				{
+					"finish_reason": "tool_calls",
+					"message": {"content": "more"}
+				}
+			]
+		}`),
+	}
+
+	summary := formatSummary(record)
+
+	checks := []string{
+		"## Artifacts",
+		"- Request JSON: `request.json`",
+		"- Response JSON: `response.json`",
+		"## Provider Diagnostics",
+		"- openai-request-id: `req_123`",
+		"- x-request-id: `abc, def`",
+		"## Finish Reasons",
+		"- Choice 1: `stop`",
+		"- Choice 2: `tool_calls`",
+		"## Usage",
+		"- Cached Input Tokens: `25`",
+		"- Cache Hit Rate: `25.0%`",
+	}
+
+	for _, want := range checks {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q\n\nsummary:\n%s", want, summary)
+		}
+	}
+
+	if strings.Contains(summary, "## Cache Efficiency") {
+		t.Fatalf("summary should not include standalone Cache Efficiency section\n\nsummary:\n%s", summary)
+	}
+}
+
+func assertSectionOrder(t *testing.T, content string, sections ...string) {
+	t.Helper()
+
+	previousIndex := -1
+	for _, section := range sections {
+		index := strings.Index(content, section)
+		if index == -1 {
+			t.Fatalf("summary missing section %q\n\nsummary:\n%s", section, content)
+		}
+		if index <= previousIndex {
+			t.Fatalf("summary section %q is out of order\n\nsummary:\n%s", section, content)
+		}
+		previousIndex = index
+	}
+}
+
+func TestRecorderSummaryPath(t *testing.T) {
+	recorder := New(config.LoggingConfig{Dir: "logs"})
+	record := RequestRecord{
+		TraceID:   "trace_20260601_123456_789",
+		StartedAt: time.Date(2026, 6, 1, 12, 34, 56, 0, time.UTC),
+	}
+
+	want := filepath.Join("logs", "2026-06-01", "trace_20260601_123456_789", "summary.md")
+	if got := recorder.SummaryPath(record); got != want {
+		t.Fatalf("summary path = %q, want %q", got, want)
 	}
 }
 
@@ -118,6 +238,41 @@ func TestFormatSummaryIncludesStreamUsage(t *testing.T) {
 		"- Cached Input Tokens: `7`",
 		"## Assistant Output",
 		"Hi",
+	}
+
+	for _, want := range checks {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q\n\nsummary:\n%s", want, summary)
+		}
+	}
+}
+
+func TestFormatSummaryIncludesStreamFinishReasons(t *testing.T) {
+	record := RequestRecord{
+		TraceID:     "trace_20260601_123456_789",
+		StartedAt:   time.Date(2026, 6, 1, 12, 34, 56, 0, time.UTC),
+		Method:      "POST",
+		Path:        "/v1/chat/completions",
+		UpstreamURL: "https://upstream.example.com/v1",
+		StatusCode:  200,
+		Duration:    123 * time.Millisecond,
+		Stream:      true,
+		Body: []byte(`{
+			"model": "gpt-4.1-mini",
+			"messages": [{"role": "user", "content": "hello"}]
+		}`),
+		ResponseBody: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n" +
+			"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n" +
+			"data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n" +
+			"data: [DONE]\n\n"),
+	}
+
+	summary := formatSummary(record)
+
+	checks := []string{
+		"## Finish Reasons",
+		"- Choice 1: `stop`",
+		"- Choice 2: `length`",
 	}
 
 	for _, want := range checks {

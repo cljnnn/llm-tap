@@ -78,7 +78,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if recordErr := h.recorder.Record(logRecord); recordErr != nil {
 			log.Printf("record failed: %v", recordErr)
 		}
-		logTraceSummary(logRecord)
+		logTraceSummary(logRecord, h.recorder.SummaryPath(logRecord))
 		h.writeError(w, http.StatusBadGateway, "forward request", err)
 		return
 	}
@@ -101,7 +101,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if recordErr := h.recorder.Record(logRecord); recordErr != nil {
 		log.Printf("record failed: %v", recordErr)
 	}
-	logTraceSummary(logRecord)
+	logTraceSummary(logRecord, h.recorder.SummaryPath(logRecord))
 }
 
 func (h *Handler) upstreamURL(requestURL *url.URL) (string, error) {
@@ -197,9 +197,9 @@ func requestWantsStream(body []byte) bool {
 	return payload.Stream
 }
 
-func logTraceSummary(record recorder.RequestRecord) {
+func logTraceSummary(record recorder.RequestRecord, summaryPath string) {
 	log.Printf(
-		"trace_id=%s status=%d latency=%dms model=%s stream=%t path=%s upstream_url=%s",
+		"trace_id=%s status=%d latency=%dms model=%s stream=%t path=%s upstream_url=%s summary=%s",
 		record.TraceID,
 		record.StatusCode,
 		record.Duration.Milliseconds(),
@@ -207,6 +207,7 @@ func logTraceSummary(record recorder.RequestRecord) {
 		record.Stream,
 		record.Path,
 		record.UpstreamURL,
+		summaryPath,
 	)
 }
 
