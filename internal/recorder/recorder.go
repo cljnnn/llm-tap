@@ -160,9 +160,9 @@ func formatSummary(record RequestRecord) string {
 		builder.WriteString("## Messages\n\n")
 		for _, message := range request.Messages {
 			builder.WriteString(formatMessageHeading(message))
-			builder.WriteString(formatContent(message.Content))
+			builder.WriteString(formatMessageContent(message))
 			if len(message.ToolCalls) > 0 {
-				if message.Content != nil && formatContent(message.Content) != "" {
+				if message.Content != nil && formatMessageContent(message) != "" {
 					builder.WriteString("\n\n")
 				}
 				builder.WriteString("#### Tool Calls\n\n")
@@ -235,6 +235,13 @@ func formatMessageHeading(message openAIMessage) string {
 	return fmt.Sprintf("### %s\n\n", emptyAsUnknown(message.Role))
 }
 
+func formatMessageContent(message openAIMessage) string {
+	if message.Role == "tool" {
+		return formatToolResultContent(message.Content)
+	}
+	return formatContent(message.Content)
+}
+
 func formatContent(content any) string {
 	switch value := content.(type) {
 	case string:
@@ -245,6 +252,21 @@ func formatContent(content any) string {
 		data, err := json.MarshalIndent(value, "", "  ")
 		if err != nil {
 			return fmt.Sprintf("%v", value)
+		}
+		return "```json\n" + string(data) + "\n```"
+	}
+}
+
+func formatToolResultContent(content any) string {
+	switch value := content.(type) {
+	case string:
+		return formatJSONCodeBlock(strings.TrimSpace(value))
+	case nil:
+		return ""
+	default:
+		data, err := json.MarshalIndent(value, "", "  ")
+		if err != nil {
+			return fmt.Sprintf("```text\n%v\n```", value)
 		}
 		return "```json\n" + string(data) + "\n```"
 	}

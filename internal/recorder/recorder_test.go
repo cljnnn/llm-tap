@@ -69,6 +69,7 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 		"#### Tool Calls",
 		"`call_1`",
 		"#### Tool Results — `call_1`",
+		"```text\nsunny\n```",
 		"## Reasoning Output",
 		"I used the tool result to answer.",
 		"## Usage",
