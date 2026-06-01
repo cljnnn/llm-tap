@@ -1,0 +1,4 @@
+config.yaml
+logs/
+/llm-tap
+*.log
