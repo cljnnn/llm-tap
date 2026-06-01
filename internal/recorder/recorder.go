@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -147,6 +149,12 @@ func formatSummary(record RequestRecord) string {
 	request := parseOpenAIRequest(record.Body)
 	builder.WriteString(fmt.Sprintf("- Model: `%s`\n", emptyAsUnknown(request.Model)))
 	builder.WriteString("\n")
+
+	if usage := usageOutput(record); usage != "" {
+		builder.WriteString("## Usage\n\n")
+		builder.WriteString(usage)
+		builder.WriteString("\n\n")
+	}
 
 	if len(request.Messages) > 0 {
 		builder.WriteString("## Messages\n\n")
@@ -316,6 +324,146 @@ func reasoningOutput(record RequestRecord) string {
 		}
 	}
 	return strings.Join(parts, "\n\n---\n\n")
+}
+
+func usageOutput(record RequestRecord) string {
+	usage := responseUsage(record)
+	if len(usage) == 0 {
+		return ""
+	}
+
+	fields := []struct {
+		label string
+		paths [][]string
+	}{
+		{label: "Input Tokens", paths: [][]string{{"prompt_tokens"}, {"input_tokens"}}},
+		{label: "Output Tokens", paths: [][]string{{"completion_tokens"}, {"output_tokens"}}},
+		{label: "Total Tokens", paths: [][]string{{"total_tokens"}}},
+		{label: "Cached Input Tokens", paths: [][]string{{"prompt_tokens_details", "cached_tokens"}, {"input_tokens_details", "cached_tokens"}}},
+		{label: "Cache Creation Input Tokens", paths: [][]string{{"cache_creation_input_tokens"}}},
+		{label: "Cache Read Input Tokens", paths: [][]string{{"cache_read_input_tokens"}}},
+		{label: "Reasoning Tokens", paths: [][]string{{"completion_tokens_details", "reasoning_tokens"}, {"output_tokens_details", "reasoning_tokens"}}},
+	}
+
+	var lines []string
+	for _, field := range fields {
+		if value, ok := firstUsageTokenCount(usage, field.paths); ok {
+			lines = append(lines, fmt.Sprintf("- %s: `%s`", field.label, value))
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func responseUsage(record RequestRecord) map[string]any {
+	if record.Stream {
+		return streamUsage(record.ResponseBody)
+	}
+
+	var response struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(record.ResponseBody, &response); err != nil {
+		return nil
+	}
+	return response.Usage
+}
+
+func streamUsage(body []byte) map[string]any {
+	var usage map[string]any
+	for _, event := range streamDataEvents(body) {
+		var payload struct {
+			Usage map[string]any `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(event), &payload); err != nil {
+			continue
+		}
+		if len(payload.Usage) > 0 {
+			usage = payload.Usage
+		}
+	}
+	return usage
+}
+
+func firstUsageTokenCount(payload map[string]any, paths [][]string) (string, bool) {
+	for _, path := range paths {
+		if value, ok := usageNumber(payload, path); ok {
+			return formatTokenCount(value), true
+		}
+	}
+	return "", false
+}
+
+func usageNumber(payload map[string]any, path []string) (float64, bool) {
+	var current any = payload
+	for _, key := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		current, ok = object[key]
+		if !ok {
+			return 0, false
+		}
+	}
+
+	switch value := current.(type) {
+	case float64:
+		return value, true
+	case json.Number:
+		number, err := value.Float64()
+		return number, err == nil
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return 0, false
+		}
+		number, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return 0, false
+		}
+		return number, true
+	default:
+		return 0, false
+	}
+}
+
+func formatTokenCount(value float64) string {
+	rounded := int64(math.Round(value))
+	exact := formatIntWithCommas(rounded)
+
+	abs := math.Abs(float64(rounded))
+	switch {
+	case abs >= 1_000_000:
+		return fmt.Sprintf("%s (%.2fM)", exact, float64(rounded)/1_000_000)
+	case abs >= 1_000:
+		return fmt.Sprintf("%s (%.2fK)", exact, float64(rounded)/1_000)
+	default:
+		return exact
+	}
+}
+
+func formatIntWithCommas(value int64) string {
+	negative := value < 0
+	if negative {
+		value = -value
+	}
+
+	digits := strconv.FormatInt(value, 10)
+	firstGroupLength := len(digits) % 3
+	if firstGroupLength == 0 {
+		firstGroupLength = 3
+	}
+
+	var builder strings.Builder
+	if negative {
+		builder.WriteString("-")
+	}
+	builder.WriteString(digits[:firstGroupLength])
+	for index := firstGroupLength; index < len(digits); index += 3 {
+		builder.WriteString(",")
+		builder.WriteString(digits[index : index+3])
+	}
+	return builder.String()
 }
 
 func extractStreamText(body []byte) string {
