@@ -111,6 +111,82 @@ func TestFormatSummaryIncludesToolCallsReasoningAndAssistantOutputs(t *testing.T
 	assertSectionOrder(t, summary, "## Artifacts", "## Usage", "## Request Parameters")
 }
 
+func TestFormatToolResultContentDecodesNestedJSONStringPayloads(t *testing.T) {
+	rendered := formatMessageContent(openAIMessage{
+		Role: "tool",
+		Content: `{
+			"nested_object": "{\"foo\":\"bar\"}",
+			"nested_array": "[{\"id\":1},{\"id\":2}]",
+			"status": "ok"
+		}`,
+	})
+
+	for _, want := range []string{
+		"```json",
+		"\"nested_object\": {",
+		"\"foo\": \"bar\"",
+		"\"nested_array\": [",
+		"\"id\": 1",
+		"\"status\": \"ok\"",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered tool result missing %q\n\nrendered:\n%s", want, rendered)
+		}
+	}
+
+	for _, unwanted := range []string{`"{\\\"foo\\\":\\\"bar\\\"}"`, `"[{\\\"id\\\":1},{\\\"id\\\":2}]"`} {
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("rendered tool result should decode nested JSON strings, found %q\n\nrendered:\n%s", unwanted, rendered)
+		}
+	}
+}
+
+func TestFormatToolResultContentRendersPlainTextAsTextCodeBlock(t *testing.T) {
+	rendered := formatMessageContent(openAIMessage{
+		Role:    "tool",
+		Content: "just a plain tool result",
+	})
+
+	if rendered != "```text\njust a plain tool result\n```" {
+		t.Fatalf("rendered tool result = %q, want plain text code block", rendered)
+	}
+}
+
+func TestFormatSummaryCanPreserveNestedJSONStringPayloads(t *testing.T) {
+	record := RequestRecord{
+		TraceID:     "trace_20260601_123456_789",
+		StartedAt:   time.Date(2026, 6, 1, 12, 34, 56, 0, time.UTC),
+		Method:      "POST",
+		Path:        "/v1/chat/completions",
+		UpstreamURL: "https://upstream.example.com/v1",
+		StatusCode:  200,
+		Duration:    123 * time.Millisecond,
+		Body: []byte(`{
+			"model": "gpt-4.1-mini",
+			"messages": [
+				{
+					"role": "tool",
+					"content": "{\"nested_object\":\"{\\\"foo\\\":\\\"bar\\\"}\",\"nested_array\":\"[{\\\"id\\\":1}]\"}"
+				}
+			]
+		}`),
+	}
+
+	summary := formatSummaryWithOptions(record, summaryFormatOptions{ExpandNestedJSON: false})
+
+	for _, want := range []string{`"nested_object": "{\"foo\":\"bar\"}"`, `"nested_array": "[{\"id\":1}]"`} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary should preserve nested JSON string %q\n\nsummary:\n%s", want, summary)
+		}
+	}
+
+	for _, unwanted := range []string{"\"nested_object\": {", "\"foo\": \"bar\"", "\"nested_array\": ["} {
+		if strings.Contains(summary, unwanted) {
+			t.Fatalf("summary should not expand nested JSON string %q\n\nsummary:\n%s", unwanted, summary)
+		}
+	}
+}
+
 func TestFormatSummaryIncludesArtifactsProviderDiagnosticsFinishReasonsAndCacheEfficiency(t *testing.T) {
 	record := RequestRecord{
 		TraceID:     "trace_20260601_123456_789",

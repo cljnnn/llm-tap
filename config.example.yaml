@@ -8,3 +8,4 @@ upstream:
 logging:
   dir: "./logs"
   pretty_json: true
+  expand_nested_json: true

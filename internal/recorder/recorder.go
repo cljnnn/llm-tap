@@ -60,7 +60,9 @@ func (r *Recorder) Record(record RequestRecord) error {
 	if err := writeJSON(filepath.Join(dir, "response.json"), responseLog(record), r.cfg.PrettyJSON); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "summary.md"), []byte(formatSummary(record)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "summary.md"), []byte(formatSummaryWithOptions(record, summaryFormatOptions{
+		ExpandNestedJSON: r.cfg.ExpandNestedJSON,
+	})), 0o644); err != nil {
 		return err
 	}
 
@@ -141,6 +143,29 @@ func decodeResponseBody(record RequestRecord) any {
 }
 
 func formatSummary(record RequestRecord) string {
+	return formatSummaryWithOptions(record, summaryFormatOptions{ExpandNestedJSON: true})
+}
+
+type summaryFormatOptions struct {
+	ExpandNestedJSON bool
+}
+
+type nestedJSONMode int
+
+const (
+	preserveNestedJSON nestedJSONMode = iota
+	expandNestedJSON
+)
+
+func (options summaryFormatOptions) nestedJSONMode() nestedJSONMode {
+	if options.ExpandNestedJSON {
+		return expandNestedJSON
+	}
+	return preserveNestedJSON
+}
+
+func formatSummaryWithOptions(record RequestRecord, options summaryFormatOptions) string {
+	mode := options.nestedJSONMode()
 	var builder strings.Builder
 	builder.WriteString("# LLM Trace\n\n")
 	builder.WriteString(fmt.Sprintf("- Trace ID: `%s`\n", record.TraceID))
@@ -171,7 +196,7 @@ func formatSummary(record RequestRecord) string {
 		builder.WriteString("\n\n")
 	}
 
-	if requestParameters := requestParametersOutput(record.Body); requestParameters != "" {
+	if requestParameters := requestParametersOutput(record.Body, mode); requestParameters != "" {
 		builder.WriteString("## Request Parameters\n\n")
 		builder.WriteString(requestParameters)
 		builder.WriteString("\n\n")
@@ -183,7 +208,7 @@ func formatSummary(record RequestRecord) string {
 		builder.WriteString("\n\n")
 	}
 
-	if responseMetadata := responseMetadataOutput(record); responseMetadata != "" {
+	if responseMetadata := responseMetadataOutput(record, mode); responseMetadata != "" {
 		builder.WriteString("## Response Metadata\n\n")
 		builder.WriteString(responseMetadata)
 		builder.WriteString("\n\n")
@@ -199,19 +224,19 @@ func formatSummary(record RequestRecord) string {
 		builder.WriteString("## Messages\n\n")
 		for _, message := range request.Messages {
 			builder.WriteString(formatMessageHeading(message))
-			builder.WriteString(formatMessageContent(message))
+			builder.WriteString(formatMessageContentWithMode(message, mode))
 			if len(message.ToolCalls) > 0 {
-				if message.Content != nil && formatMessageContent(message) != "" {
+				if message.Content != nil && formatMessageContentWithMode(message, mode) != "" {
 					builder.WriteString("\n\n")
 				}
 				builder.WriteString("#### Tool Calls\n\n")
-				builder.WriteString(formatToolCalls(message.ToolCalls))
+				builder.WriteString(formatToolCalls(message.ToolCalls, mode))
 			}
 			builder.WriteString("\n\n")
 		}
 	}
 
-	responseToolCalls := toolCallOutput(record)
+	responseToolCalls := toolCallOutput(record, mode)
 	if responseToolCalls != "" {
 		builder.WriteString("## Tool Calls\n\n")
 		builder.WriteString(responseToolCalls)
@@ -320,8 +345,12 @@ func formatMessageHeading(message openAIMessage) string {
 }
 
 func formatMessageContent(message openAIMessage) string {
+	return formatMessageContentWithMode(message, expandNestedJSON)
+}
+
+func formatMessageContentWithMode(message openAIMessage, mode nestedJSONMode) string {
 	if message.Role == "tool" {
-		return formatToolResultContent(message.Content)
+		return formatToolResultContent(message.Content, mode)
 	}
 	return formatContent(message.Content)
 }
@@ -341,14 +370,14 @@ func formatContent(content any) string {
 	}
 }
 
-func formatToolResultContent(content any) string {
+func formatToolResultContent(content any, mode nestedJSONMode) string {
 	switch value := content.(type) {
 	case string:
-		return formatJSONCodeBlock(strings.TrimSpace(value))
+		return formatJSONCodeBlock(strings.TrimSpace(value), mode)
 	case nil:
 		return ""
 	default:
-		data, err := json.MarshalIndent(value, "", "  ")
+		data, err := json.MarshalIndent(normalizeNestedJSONStrings(value, mode), "", "  ")
 		if err != nil {
 			return fmt.Sprintf("```text\n%v\n```", value)
 		}
@@ -442,9 +471,9 @@ func extractStreamFinishReasons(body []byte) []string {
 	return reasons
 }
 
-func toolCallOutput(record RequestRecord) string {
+func toolCallOutput(record RequestRecord, mode nestedJSONMode) string {
 	if record.Stream {
-		return formatAnyToolCallDeltas(extractStreamToolCalls(record.ResponseBody))
+		return formatAnyToolCallDeltas(extractStreamToolCalls(record.ResponseBody), mode)
 	}
 
 	var response struct {
@@ -462,7 +491,7 @@ func toolCallOutput(record RequestRecord) string {
 	var parts []string
 	for _, choice := range response.Choices {
 		if len(choice.Message.ToolCalls) > 0 {
-			parts = append(parts, formatToolCalls(choice.Message.ToolCalls))
+			parts = append(parts, formatToolCalls(choice.Message.ToolCalls, mode))
 		}
 	}
 	return strings.Join(parts, "\n\n---\n\n")
@@ -492,18 +521,18 @@ func reasoningOutput(record RequestRecord) string {
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
-func requestParametersOutput(body []byte) string {
+func requestParametersOutput(body []byte, mode nestedJSONMode) string {
 	parameters := topLevelJSONObject(body)
 	delete(parameters, "model")
 	delete(parameters, "messages")
-	return formatObjectFields(parameters)
+	return formatObjectFields(parameters, mode)
 }
 
-func responseMetadataOutput(record RequestRecord) string {
+func responseMetadataOutput(record RequestRecord, mode nestedJSONMode) string {
 	metadata := responseMetadata(record)
 	delete(metadata, "choices")
 	delete(metadata, "usage")
-	return formatObjectFields(metadata)
+	return formatObjectFields(metadata, mode)
 }
 
 func responseMetadata(record RequestRecord) map[string]any {
@@ -534,7 +563,7 @@ func topLevelJSONObject(data []byte) map[string]any {
 	return object
 }
 
-func formatObjectFields(fields map[string]any) string {
+func formatObjectFields(fields map[string]any, mode nestedJSONMode) string {
 	if len(fields) == 0 {
 		return ""
 	}
@@ -554,7 +583,7 @@ func formatObjectFields(fields map[string]any) string {
 		}
 
 		builder.WriteString(fmt.Sprintf("- %s:\n", key))
-		builder.WriteString(formatAnyAsJSONCodeBlock(value))
+		builder.WriteString(formatAnyAsJSONCodeBlock(value, mode))
 		builder.WriteString("\n")
 	}
 
@@ -584,8 +613,8 @@ func formatScalarFieldValue(value any) (string, bool) {
 	}
 }
 
-func formatAnyAsJSONCodeBlock(value any) string {
-	data, err := json.MarshalIndent(value, "", "  ")
+func formatAnyAsJSONCodeBlock(value any, mode nestedJSONMode) string {
+	data, err := json.MarshalIndent(normalizeNestedJSONStrings(value, mode), "", "  ")
 	if err != nil {
 		return fmt.Sprintf("```text\n%v\n```", value)
 	}
@@ -820,7 +849,7 @@ func extractStreamToolCalls(body []byte) []any {
 	return calls
 }
 
-func formatToolCalls(toolCalls []toolCall) string {
+func formatToolCalls(toolCalls []toolCall, mode nestedJSONMode) string {
 	var builder strings.Builder
 	for index, toolCall := range toolCalls {
 		builder.WriteString(fmt.Sprintf("%d. `%s`", index+1, emptyAsUnknown(toolCall.Function.Name)))
@@ -833,32 +862,80 @@ func formatToolCalls(toolCalls []toolCall) string {
 		if arguments == "" {
 			arguments = "{}"
 		}
-		builder.WriteString(formatJSONCodeBlock(arguments))
+		builder.WriteString(formatJSONCodeBlock(arguments, mode))
 		builder.WriteString("\n")
 	}
 	return strings.TrimSpace(builder.String())
 }
 
-func formatAnyToolCallDeltas(toolCallDeltas []any) string {
+func formatAnyToolCallDeltas(toolCallDeltas []any, mode nestedJSONMode) string {
 	if len(toolCallDeltas) == 0 {
 		return ""
 	}
-	data, err := json.MarshalIndent(toolCallDeltas, "", "  ")
+	data, err := json.MarshalIndent(normalizeNestedJSONStrings(toolCallDeltas, mode), "", "  ")
 	if err != nil {
 		return fmt.Sprintf("%v", toolCallDeltas)
 	}
 	return "```json\n" + string(data) + "\n```"
 }
 
-func formatJSONCodeBlock(value string) string {
-	var decoded any
-	if err := json.Unmarshal([]byte(value), &decoded); err == nil {
+func formatJSONCodeBlock(value string, mode nestedJSONMode) string {
+	if decoded, ok := decodeNestedJSONStrings(value, mode); ok {
 		data, err := json.MarshalIndent(decoded, "", "  ")
 		if err == nil {
 			return "```json\n" + string(data) + "\n```"
 		}
 	}
 	return "```text\n" + value + "\n```"
+}
+
+func normalizeNestedJSONStrings(value any, mode nestedJSONMode) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		decoded := make(map[string]any, len(typed))
+		for key, value := range typed {
+			decoded[key] = normalizeNestedJSONStrings(value, mode)
+		}
+		return decoded
+	case []any:
+		decoded := make([]any, 0, len(typed))
+		for _, value := range typed {
+			decoded = append(decoded, normalizeNestedJSONStrings(value, mode))
+		}
+		return decoded
+	case string:
+		if mode == expandNestedJSON {
+			if decoded, ok := decodeNestedJSONStrings(typed, mode); ok {
+				return decoded
+			}
+		}
+		return typed
+	default:
+		return typed
+	}
+}
+
+func decodeNestedJSONStrings(value string, mode nestedJSONMode) (any, bool) {
+	trimmed := strings.TrimSpace(value)
+	if !looksLikeJSONObjectOrArray(trimmed) {
+		return nil, false
+	}
+
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return nil, false
+	}
+	if mode == expandNestedJSON {
+		return normalizeNestedJSONStrings(decoded, mode), true
+	}
+	return decoded, true
+}
+
+func looksLikeJSONObjectOrArray(value string) bool {
+	if len(value) < 2 {
+		return false
+	}
+	return value[0] == '{' && value[len(value)-1] == '}' || value[0] == '[' && value[len(value)-1] == ']'
 }
 
 func streamDataEvents(body []byte) []string {

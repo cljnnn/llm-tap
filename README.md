@@ -32,6 +32,7 @@ upstream:
 logging:
   dir: "./logs"
   pretty_json: true
+  expand_nested_json: true
 ```
 
 llm-tap does not modify request bodies. It only forwards and records traffic.
@@ -47,4 +48,5 @@ logs/YYYY-MM-DD/trace_xxx/
   summary.md
 ```
 
-`summary.md` extracts the model, messages, latency, stream flag, and assistant output.
+`summary.md` extracts the model, messages, latency, stream flag, tool calls, tool results, and assistant output.
+Set `logging.expand_nested_json` to `false` to keep JSON-encoded strings unchanged in summaries.

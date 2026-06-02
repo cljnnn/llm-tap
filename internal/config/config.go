@@ -27,8 +27,9 @@ type UpstreamConfig struct {
 }
 
 type LoggingConfig struct {
-	Dir        string
-	PrettyJSON bool
+	Dir              string
+	PrettyJSON       bool
+	ExpandNestedJSON bool
 }
 
 func Load(path string) (Config, error) {
@@ -69,6 +70,13 @@ func Load(path string) (Config, error) {
 		}
 		cfg.Logging.PrettyJSON = pretty
 	}
+	if value := values["logging.expand_nested_json"]; value != "" {
+		expand, err := strconv.ParseBool(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("logging.expand_nested_json must be true or false")
+		}
+		cfg.Logging.ExpandNestedJSON = expand
+	}
 	if cfg.Upstream.BaseURL == "" {
 		return Config{}, fmt.Errorf("upstream.base_url is required")
 	}
@@ -88,8 +96,9 @@ func defaultConfig() Config {
 			Timeout:        120 * time.Second,
 		},
 		Logging: LoggingConfig{
-			Dir:        "./logs",
-			PrettyJSON: true,
+			Dir:              "./logs",
+			PrettyJSON:       true,
+			ExpandNestedJSON: true,
 		},
 	}
 }
